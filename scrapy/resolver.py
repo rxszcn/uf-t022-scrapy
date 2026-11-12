@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Self
 
 import attr
 from twisted.internet import defer
 from twisted.internet.base import ReactorBase, ThreadedResolver
+from twisted.internet.error import DNSLookupError
 from twisted.internet.interfaces import (
     IAddress,
     IHostnameResolver,
@@ -12,19 +14,61 @@ from twisted.internet.interfaces import (
     IResolutionReceiver,
     IResolverSimple,
 )
+from twisted.python.failure import Failure
 from zope.interface.declarations import implementer, provider
 
 from scrapy.utils._datatypes import LocalCache
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
     from twisted.internet.defer import Deferred
 
     from scrapy.crawler import Crawler
 
-# TODO: cache misses
-dnscache: LocalCache[str, Any] = LocalCache(10000)
+
+class _NegativeCacheEntry:
+    """A cached name resolution failure."""
+
+    def __init__(self, error: BaseException):
+        self.error: BaseException = error
+
+
+class _ExpiringCache(LocalCache[str, Any]):
+    """A :class:`LocalCache` whose entries expire some time after they are
+    set."""
+
+    def __init__(self, limit: int | None = None):
+        super().__init__(limit)
+        # Seconds that an entry stays valid, 0 means no expiration.
+        self.ttl: float = 0
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        expires = monotonic() + self.ttl if self.ttl else None
+        super().__setitem__(key, (value, expires))
+
+    def __getitem__(self, key: str) -> Any:
+        value, expires = super().__getitem__(key)
+        if expires is not None and expires <= monotonic():
+            super().__delitem__(key)
+            raise KeyError(key)
+        return value
+
+    def __contains__(self, key: str) -> bool:  # type: ignore[override]
+        try:
+            self[key]
+        except KeyError:
+            return False
+        return True
+
+    def get(self, key: str, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+
+dnscache: _ExpiringCache = _ExpiringCache(10000)
 
 
 @implementer(IResolverSimple)
@@ -33,10 +77,21 @@ class CachingThreadedResolver(ThreadedResolver):
     Default caching resolver. IPv4 only, supports setting a timeout value for DNS requests.
     """
 
-    def __init__(self, reactor: ReactorBase, cache_size: int, timeout: float):
+    def __init__(
+        self,
+        reactor: ReactorBase,
+        cache_size: int,
+        timeout: float,
+        cache_ttl: float = 0,
+    ):
         super().__init__(reactor)
         dnscache.limit = cache_size
+        dnscache.ttl = cache_ttl
         self.timeout = timeout
+        # Names with a resolution in flight, mapped to the deferreds waiting
+        # for it, so that concurrent requests for the same name share a
+        # single resolution.
+        self._resolutions: dict[str, list[Deferred[str]]] = {}
 
     @classmethod
     def from_crawler(cls, crawler: Crawler, reactor: ReactorBase) -> Self:
@@ -44,14 +99,31 @@ class CachingThreadedResolver(ThreadedResolver):
             cache_size = crawler.settings.getint("DNSCACHE_SIZE")
         else:
             cache_size = 0
-        return cls(reactor, cache_size, crawler.settings.getfloat("DNS_TIMEOUT"))
+        return cls(
+            reactor,
+            cache_size,
+            crawler.settings.getfloat("DNS_TIMEOUT"),
+            crawler.settings.getfloat("DNSCACHE_TTL"),
+        )
 
     def install_on_reactor(self) -> None:
         self.reactor.installResolver(self)
 
     def getHostByName(self, name: str, timeout: Sequence[int] = ()) -> Deferred[str]:
-        if name in dnscache:
-            return defer.succeed(dnscache[name])
+        try:
+            result = dnscache[name]
+        except KeyError:
+            pass
+        else:
+            if isinstance(result, _NegativeCacheEntry):
+                return defer.fail(result.error)
+            return defer.succeed(result)
+        follower: Deferred[str] = defer.Deferred()
+        waiters = self._resolutions.get(name)
+        if waiters is not None:
+            waiters.append(follower)
+            return follower
+        self._resolutions[name] = [follower]
         # in Twisted<=16.6, getHostByName() is always called with
         # a default timeout of 60s (actually passed as (1, 3, 11, 45) tuple),
         # so the input argument above is simply overridden
@@ -59,12 +131,23 @@ class CachingThreadedResolver(ThreadedResolver):
         # The timeout arg is typed as Sequence[int] but supports floats.
         timeout = (self.timeout,)  # type: ignore[assignment]
         d = super().getHostByName(name, timeout)
-        if dnscache.limit:
-            d.addCallback(self._cache_result, name)
-        return d
+        d.addBoth(self._cache_result, name)
+        return follower
 
-    def _cache_result(self, result: str, name: str) -> str:
+    def _cache_result(self, result: Any, name: str) -> Any:
+        waiters = self._resolutions.pop(name)
+        if isinstance(result, Failure):
+            assert result.value is not None
+            dnscache[name] = _NegativeCacheEntry(result.value)
+            for waiter in waiters:
+                if not waiter.called:
+                    waiter.errback(result)
+            # The waiters get the failure, do not also propagate it.
+            return None
         dnscache[name] = result
+        for waiter in waiters:
+            if not waiter.called:
+                waiter.callback(result)
         return result
 
 
@@ -85,27 +168,37 @@ class HostResolution:
 
 @provider(IResolutionReceiver)
 class _CachingResolutionReceiver:
-    def __init__(self, resolutionReceiver: IResolutionReceiver, hostName: str):
-        self.resolutionReceiver: IResolutionReceiver = resolutionReceiver
+    """Caches the result of a name resolution and forwards it to the
+    receivers of all requests that started it or joined it while in
+    flight."""
+
+    def __init__(self, hostName: str, on_complete: Callable[[str], Any]):
         self.hostName: str = hostName
+        self.on_complete: Callable[[str], Any] = on_complete
+        self.receivers: list[tuple[IResolutionReceiver, int]] = []
         self.addresses: list[IAddress] = []
 
     def resolutionBegan(self, resolution: IHostResolution) -> None:
-        self.resolutionReceiver.resolutionBegan(resolution)
-        self.resolution = resolution
+        for receiver, _ in self.receivers:
+            receiver.resolutionBegan(resolution)
 
     def addressResolved(self, address: IAddress) -> None:
-        self.resolutionReceiver.addressResolved(address)
-        self.addresses.append(address)
+        for receiver, port in self.receivers:
+            receiver.addressResolved(_address_with_port(address, port))
+        # Name resolution does not depend on the port, so cache entries are
+        # kept port-agnostic and the requested port is set on cache hits.
+        self.addresses.append(_address_with_port(address, 0))
 
     def resolutionComplete(self) -> None:
-        self.resolutionReceiver.resolutionComplete()
+        for receiver, _ in self.receivers:
+            receiver.resolutionComplete()
         if self.addresses:
-            # Name resolution does not depend on the port, so cache entries are
-            # kept port-agnostic and the requested port is set on cache hits.
-            dnscache[self.hostName] = [
-                _address_with_port(address, 0) for address in self.addresses
-            ]
+            dnscache[self.hostName] = self.addresses
+        else:
+            dnscache[self.hostName] = _NegativeCacheEntry(
+                DNSLookupError(f"DNS lookup failed for {self.hostName}")
+            )
+        self.on_complete(self.hostName)
 
 
 @implementer(IHostnameResolver)
@@ -115,10 +208,14 @@ class CachingHostnameResolver:
     does not support setting a timeout value for DNS requests.
     """
 
-    def __init__(self, reactor: ReactorBase, cache_size: int):
+    def __init__(self, reactor: ReactorBase, cache_size: int, cache_ttl: float = 0):
         self.reactor: ReactorBase = reactor
         self.original_resolver: IHostnameResolver = reactor.nameResolver
         dnscache.limit = cache_size
+        dnscache.ttl = cache_ttl
+        # Names with a resolution in flight, so that concurrent requests for
+        # the same name share a single resolution.
+        self._resolutions: dict[str, _CachingResolutionReceiver] = {}
 
     @classmethod
     def from_crawler(cls, crawler: Crawler, reactor: ReactorBase) -> Self:
@@ -126,7 +223,7 @@ class CachingHostnameResolver:
             cache_size = crawler.settings.getint("DNSCACHE_SIZE")
         else:
             cache_size = 0
-        return cls(reactor, cache_size)
+        return cls(reactor, cache_size, crawler.settings.getfloat("DNSCACHE_TTL"))
 
     def install_on_reactor(self) -> None:
         self.reactor.installNameResolver(self)
@@ -140,17 +237,33 @@ class CachingHostnameResolver:
         transportSemantics: str = "TCP",
     ) -> IHostResolution:
         try:
-            addresses = dnscache[hostName]
+            result = dnscache[hostName]
         except KeyError:
+            pass
+        else:
+            resolutionReceiver.resolutionBegan(HostResolution(hostName))
+            if not isinstance(result, _NegativeCacheEntry):
+                for address in result:
+                    resolutionReceiver.addressResolved(
+                        _address_with_port(address, portNumber)
+                    )
+            resolutionReceiver.resolutionComplete()
+            return resolutionReceiver
+        receiving = self._resolutions.get(hostName)
+        if receiving is not None:
+            receiving.receivers.append((resolutionReceiver, portNumber))
+            return resolutionReceiver
+        receiving = _CachingResolutionReceiver(hostName, self._resolutions.pop)
+        receiving.receivers.append((resolutionReceiver, portNumber))
+        self._resolutions[hostName] = receiving
+        try:
             return self.original_resolver.resolveHostName(
-                _CachingResolutionReceiver(resolutionReceiver, hostName),
+                receiving,
                 hostName,
                 portNumber,
                 addressTypes,
                 transportSemantics,
             )
-        resolutionReceiver.resolutionBegan(HostResolution(hostName))
-        for address in addresses:
-            resolutionReceiver.addressResolved(_address_with_port(address, portNumber))
-        resolutionReceiver.resolutionComplete()
-        return resolutionReceiver
+        except Exception:
+            del self._resolutions[hostName]
+            raise

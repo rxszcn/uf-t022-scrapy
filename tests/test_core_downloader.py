@@ -10,6 +10,7 @@ import pytest
 from pytest_twisted import async_yield_fixture
 from twisted.internet.defer import CancelledError, Deferred
 from twisted.internet.endpoints import HostnameEndpoint
+from twisted.internet.error import DNSLookupError
 from twisted.internet.protocol import Factory
 from twisted.internet.protocol import Protocol as TxProtocol
 from twisted.internet.ssl import AcceptableCiphers, optionsForClientTLS
@@ -39,7 +40,7 @@ from scrapy.core.downloader.handlers.base import BaseDownloadHandler
 from scrapy.core.downloader.handlers.http11 import _RequestBodyProducer
 from scrapy.exceptions import DownloadCancelledError, ScrapyDeprecationWarning
 from scrapy.http import Response
-from scrapy.resolver import dnscache
+from scrapy.resolver import _NegativeCacheEntry, dnscache
 from scrapy.utils._deps_compat import PYOPENSSL_SET_CIPHER_LIST_TMP_CONN
 from scrapy.utils.asyncio import sleep
 from scrapy.utils.defer import (
@@ -928,6 +929,27 @@ def test_get_slot_key_by_ip() -> None:
     dnscache["example.com"] = "127.0.0.1"
     try:
         assert downloader.get_slot_key(Request("http://example.com")) == "127.0.0.1"
+    finally:
+        del dnscache["example.com"]
+        downloader.close()
+
+
+def test_get_slot_key_by_ip_failed_resolution() -> None:
+    """A cached resolution failure keeps the hostname slot key, so the slot
+    is the same before and after the failed resolution."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=ScrapyDeprecationWarning,
+            message="The CONCURRENT_REQUESTS_PER_IP setting is deprecated",
+        )
+        crawler = get_crawler(settings_dict={"CONCURRENT_REQUESTS_PER_IP": 1})
+        downloader = Downloader(crawler)
+    request = Request("http://example.com")
+    assert downloader.get_slot_key(request) == "example.com"
+    dnscache["example.com"] = _NegativeCacheEntry(DNSLookupError())
+    try:
+        assert downloader.get_slot_key(request) == "example.com"
     finally:
         del dnscache["example.com"]
         downloader.close()

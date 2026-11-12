@@ -451,7 +451,13 @@ class Downloader:
 
         key = urlparse_cached(request).hostname or ""
         if self.ip_concurrency:
-            key = dnscache.get(key, key)
+            # dnscache can also hold a cached resolution failure or, with
+            # CachingHostnameResolver, a list of addresses. Only a resolved
+            # IP address keys a slot; anything else keeps the hostname, so
+            # that the slot is the same before and after such a resolution.
+            cached = dnscache.get(key)
+            if isinstance(cached, str):
+                key = cached
 
         return key
 

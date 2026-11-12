@@ -812,6 +812,22 @@ DNS in-memory cache size, see :setting:`DNSCACHE_ENABLED`.
 
 .. note:: This is a :ref:`reactor setting <reactor-settings>`.
 
+.. setting:: DNSCACHE_TTL
+
+DNSCACHE_TTL
+------------
+
+.. versionadded:: VERSION
+
+Default: ``60``
+
+Seconds that an entry of the DNS in-memory cache stays valid, see
+:setting:`DNSCACHE_ENABLED`. Both successful and failed resolutions are
+cached, and a failed one is only retried once its entry expires. ``0``
+disables expiration.
+
+.. note:: This is a :ref:`reactor setting <reactor-settings>`.
+
 .. setting:: DNS_TIMEOUT
 
 DNS_TIMEOUT
